@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>CVAI Click Measure</title>
+<style>
+  :root { --pad: 12px; }
+  body { margin: var(--pad); font-family: -apple-system, system-ui, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+  .wrap { max-width: 900px; margin: 0 auto; }
+  #c { width: 100%; height: auto; background: #f7f7f7; border-radius: 10px; touch-action: none; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom:8px; }
+  button, input[type=file] { font-size: 16px; padding: 10px 12px; border-radius: 10px; border: 1px solid #ddd; background: #fff; }
+  #panel { white-space: pre-line; background: #fff; border: 1px solid #ddd; border-radius: 10px; padding: 10px; margin-top:8px; }
+  .hint { font-size: 12px; color:#555; margin-top:6px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h2>CVAI Click-Measure Tool</h2>
+  <div class="row">
+    <input id="file" type="file" accept="image/*">
+    <button id="clear">Clear points</button>
+    <button id="undo">Undo</button>
+    <button id="download">Download PNG</button>
+    <span class="hint">Tap around the cranial horizon.</span>
+  </div>
+  <canvas id="c" width="1200" height="900"></canvas>
+  <div id="panel"></div>
+  <div class="hint">CVAI (clinical) = |d1 − d2| / max(d1, d2) × 100. Bands: Normal &lt; 3.5%, Mild 3.5-6.25%, Moderate 6.25-8.75%, Severe &gt; 8.75%.</div>
+</div>
+
+<script>
+const fileInput = document.getElementById('file');
+const canvas = document.getElementById('c');
+const panel  = document.getElementById('panel');
+const btnClear = document.getElementById('clear');
+const btnUndo  = document.getElementById('undo');
+const btnDownload = document.getElementById('download');
+
+const ctx = canvas.getContext('2d');
+let DPR = Math.max(1, window.devicePixelRatio || 1);
+
+// upscale canvas for hi-dpi so drawings are visible & crisp
+function setCanvasPixelSize(wCSS, hCSS){
+  DPR = Math.max(1, window.devicePixelRatio || 1);
+  canvas.style.width  = wCSS + "px";
+  canvas.style.height = hCSS + "px";
+  canvas.width  = Math.round(wCSS * DPR);
+  canvas.height = Math.round(hCSS * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0); // draw in CSS pixels
+}
+function fitCanvasToContainer(){
+  const W = canvas.getBoundingClientRect().width || 900;
+  const H = W * 0.75; // 4:3 default
+  setCanvasPixelSize(W, H);
+}
+fitCanvasToContainer();
+window.addEventListener('resize', fitCanvasToContainer);
+
+// image + view state
+let img = new Image();
+let imgW=0, imgH=0;
+let scale = 1, offsetX = 0, offsetY = 0;
+let points = [];
+
+// --- pointer events (tap to add, two-finger pinch + pan) ---
+let pointers = new Map(); // id -> {x,y}
+canvas.addEventListener('pointerdown', e=>{
+  canvas.setPointerCapture(e.pointerId);
+  pointers.set(e.pointerId, {x:e.clientX, y:e.clientY});
+  if (pointers.size === 1) {
+    // single tap: add point
+    const b = canvas.getBoundingClientRect();
+    const p = canvasToImage(e.clientX - b.left, e.clientY - b.top);
+    if (inImage(p.x, p.y)) {
+      points.push(p);
+      draw(); compute();
+    }
+  }
+  e.preventDefault();
+}, {passive:false});
+
+canvas.addEventListener('pointermove', e=>{
+  if (!pointers.has(e.pointerId)) return;
+  const prev = pointers.get(e.pointerId);
+  pointers.set(e.pointerId, {x:e.clientX, y:e.clientY});
+  if (pointers.size === 2) {
+    // pinch/zoom
+    const ids = Array.from(pointers.keys());
+    const a0 = pointers.get(ids[0]), a1 = pointers.get(ids[1]);
+    const b0 = (ids[0]===e.pointerId) ? prev : pointers.get(ids[0]);
+    const b1 = (ids[1]===e.pointerId) ? prev : pointers.get(ids[1]);
+    const dPrev = dist(b0, b1), dNow = dist(a0, a1);
+    const factor = (dPrev>0) ? dNow/dPrev : 1.0;
+    // zoom around midpoint
+    const r = canvas.getBoundingClientRect();
+    const cx = ((a0.x + a1.x)/2 - r.left);
+    const cy = ((a0.y + a1.y)/2 - r.top);
+    zoomAt(cx, cy, factor);
+    draw();
+  }
+  e.preventDefault();
+}, {passive:false});
+
+canvas.addEventListener('pointerup', e=>{
+  pointers.delete(e.pointerId);
+  e.preventDefault();
+}, {passive:false});
+canvas.addEventListener('pointercancel', e=>{
+  pointers.delete(e.pointerId);
+}, {passive:false});
+
+btnUndo.onclick = ()=>{ points.pop(); draw(); compute(); };
+btnClear.onclick = ()=>{ points = []; draw(); compute(); };
+btnDownload.onclick = ()=>{
+  // full-res export
+  const ex = document.createElement('canvas');
+  ex.width = imgW; ex.height = imgH;
+  const exCtx = ex.getContext('2d');
+  exCtx.drawImage(img, 0,0, imgW, imgH);
+  drawOverlay(exCtx, points, true);
+  ex.toBlob(b=>{
+    const a=document.createElement('a');
+    a.href = URL.createObjectURL(b);
+    a.download = 'cvai_annotated.png';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  });
+};
+
+fileInput.onchange = e=>{
+  const f = e.target.files[0]; if (!f) return;
+  const url = URL.createObjectURL(f);
+  img.onload = ()=>{
+    imgW = img.naturalWidth; imgH = img.naturalHeight;
+    fitToCanvas();
+    points = [];
+    draw(); compute();
+    URL.revokeObjectURL(url);
+  };
+  img.src = url;
+};
+
+// --- view helpers ---
+function dist(a,b){ return Math.hypot(a.x-b.x, a.y-b.y); }
+function canvasToImage(x,y){ return { x: (x - offsetX)/scale, y: (y - offsetY)/scale }; }
+function imageToCanvas(x,y){ return { x: x*scale + offsetX, y: y*scale + offsetY }; }
+function inImage(x,y){ return x>=0 && y>=0 && x<=imgW && y<=imgH; }
+function zoomAt(cx,cy,f){
+  const before = canvasToImage(cx,cy);
+  scale *= f;
+  const after = canvasToImage(cx,cy);
+  offsetX += (before.x - after.x)*scale;
+  offsetY += (before.y - after.y)*scale;
+}
+function fitToCanvas(){
+  const W = canvas.getBoundingClientRect().width;
+  const H = canvas.getBoundingClientRect().height;
+  const s = Math.min(W/imgW, H/imgH);
+  scale = s;
+  offsetX = (W - imgW*s)/2;
+  offsetY = (H - imgH*s)/2;
+}
+
+// --- draw ---
+function draw(){
+  ctx.clearRect(0,0,canvas.width/DPR,canvas.height/DPR);
+  if (imgW) {
+    ctx.drawImage(img, offsetX, offsetY, imgW*scale, imgH*scale);
+  }
+  drawOverlay(ctx, points, false);
+}
+
+function computePanel(pts, d1, d2){
+  if (pts.length < 5){
+    panel.textContent =
+      `Tap around the cranial horizon… (${pts.length} point${pts.length===1?'':'s'})\n` +
+      `Need at least 5 points to compute CVAI.`;
+    return;
+  }
+  const longer = Math.max(d1.len, d2.len), shorter = Math.min(d1.len, d2.len);
+  const cvaiClin = Math.abs(d1.len - d2.len) / (longer || 1) * 100.0;
+  const cvaiAlt  = Math.abs(d1.len - d2.len) / (shorter || 1) * 100.0;
+  const band = (cvaiClin<3.5) ? "Normal" : (cvaiClin<6.25)?"Mild" : (cvaiClin<8.75)?"Moderate":"Severe";
+  const color = (cvaiClin<3.5) ? "#009000" : (cvaiClin<6.25)?"#FFA500" : (cvaiClin<8.75)?"#CC8400":"#D00000";
+
+  panel.innerHTML =
+`Pseudo-CVAI (clinical): <b style="color:${color}">${cvaiClin.toFixed(1)}%</b> — ${band}
+Alt (/ shorter): ${cvaiAlt.toFixed(1)}%
+d+30: ${d1.len.toFixed(1)} px    d-30: ${d2.len.toFixed(1)} px
+Bands:
+  Normal < 3.5%
+  Mild 3.5-6.25%
+  Moderate 6.25-8.75%
+  Severe > 8.75%`;
+}
+
+function drawOverlay(g, pts, fullRes){
+  const dotR = fullRes ? 6 : 5;
+  const lineW = fullRes ? 4 : 3;
+  g.save();
+  g.lineWidth = lineW;
+
+  // 1) Always draw clicked dots (and indices)
+  g.font = `${fullRes?18:14}px system-ui, -apple-system`;
+  pts.forEach((p, idx)=>{
+    const c = fullRes ? p : imageToCanvas(p.x,p.y);
+    g.fillStyle = "rgba(255,0,0,0.95)";
+    g.beginPath(); g.arc(c.x,c.y, dotR, 0, 2*Math.PI); g.fill();
+    g.fillStyle = "#fff";
+    g.strokeStyle = "rgba(0,0,0,0.6)";
+    g.lineWidth = 3;
+    g.strokeText(String(idx+1), c.x+dotR+2, c.y-dotR-2);
+    g.fillText(String(idx+1), c.x+dotR+2, c.y-dotR-2);
+  });
+
+  // 2) Provisional polyline for visual feedback (open, not closed)
+  if (pts.length >= 2){
+    g.strokeStyle = "rgba(0,150,255,0.8)";
+    g.beginPath();
+    pts.forEach((p,i)=>{
+      const c = fullRes ? p : imageToCanvas(p.x,p.y);
+      if (i===0) g.moveTo(c.x,c.y); else g.lineTo(c.x,c.y);
+    });
+    g.stroke();
+  }
+
+  // 3) When enough points, compute hull + diagonals + panel
+  if (pts.length >= 5){
+    const hull = convexHull(pts);
+    // hull
+    g.strokeStyle = "rgba(0,180,0,0.9)";
+    g.beginPath();
+    hull.forEach((p,i)=>{
+      const c = fullRes ? p : imageToCanvas(p.x,p.y);
+      if (i===0) g.moveTo(c.x,c.y); else g.lineTo(c.x,c.y);
+    });
+    g.closePath(); g.stroke();
+
+    // PCA + diagonals
+    const {center, angle} = pcaAngle(hull);
+    const a = Math.PI/6;
+    const d1 = diagonalExtent(hull, angle + a);
+    const d2 = diagonalExtent(hull, angle - a);
+
+    // draw diagonals
+    drawDiag(g, d1.pmin, d1.pmax, fullRes);
+    drawDiag(g, d2.pmin, d2.pmax, fullRes);
+
+    computePanel(pts, d1, d2);
+  } else {
+    computePanel(pts, {len:0},{len:0});
+  }
+
+  g.restore();
+}
+
+function drawDiag(g, pmin, pmax, fullRes){
+  const a = fullRes ? pmin : imageToCanvas(pmin.x,pmin.y);
+  const b = fullRes ? pmax : imageToCanvas(pmax.x,pmax.y);
+  g.strokeStyle = "rgba(255,215,0,0.95)";
+  g.beginPath(); g.moveTo(a.x,a.y); g.lineTo(b.x,b.y); g.stroke();
+}
+
+// --- math helpers (PCA, hull, extents) ---
+function pcaAngle(pts){
+  const m = mean(pts);
+  let sxx=0, sxy=0, syy=0;
+  for (const p of pts){
+    const dx=p.x-m.x, dy=p.y-m.y;
+    sxx += dx*dx; sxy += dx*dy; syy += dy*dy;
+  }
+  const tr = sxx + syy;
+  const det = sxx*syy - sxy*sxy;
+  const t = Math.sqrt(Math.max(0, tr*tr/4 - det));
+  const lambda1 = tr/2 + t;
+  const vx = (lambda1 - syy), vy = sxy;
+  let angle = Math.atan2(vy, vx);
+  if (!isFinite(angle)) angle = 0;
+  return {center:m, angle};
+}
+function mean(pts){ let x=0,y=0; for(const p of pts){ x+=p.x; y+=p.y; } const n=pts.length||1; return {x:x/n, y:y/n}; }
+function diagonalExtent(pts, theta){
+  const ct=Math.cos(theta), st=Math.sin(theta);
+  let min=Infinity, max=-Infinity, pmin=null, pmax=null;
+  for (const p of pts){
+    const pr = p.x*ct + p.y*st;
+    if (pr<min){ min=pr; pmin=p; }
+    if (pr>max){ max=pr; pmax=p; }
+  }
+  return {len: max-min, pmin, pmax};
+}
+function convexHull(points){
+  const pts = points.map(p=>({x:p.x,y:p.y})).sort((a,b)=>a.x-b.x||a.y-b.y);
+  if (pts.length<=1) return pts;
+  const cross=(o,a,b)=>(a.x-o.x)*(b.y-o.y)-(a.y-o.y)*(b.x-o.x);
+  const lower=[]; for(const p of pts){ while(lower.length>=2 && cross(lower[lower.length-2],lower[lower.length-1],p)<=0) lower.pop(); lower.push(p); }
+  const upper=[]; for(let i=pts.length-1;i>=0;i--){ const p=pts[i]; while(upper.length>=2 && cross(upper[upper.length-2],upper[upper.length-1],p)<=0) upper.pop(); upper.push(p); }
+  upper.pop(); lower.pop(); return lower.concat(upper);
+}
+</script>
+</body>
+</html>
