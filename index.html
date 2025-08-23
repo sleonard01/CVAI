@@ -193,10 +193,9 @@ function computePanel(pts, d1, d2){
   const color = (cvaiClin<3.5) ? "#009000" : (cvaiClin<6.25)?"#FFA500" : (cvaiClin<8.75)?"#CC8400":"#D00000";
 
   panel.innerHTML =
-`Pseudo-CVAI (clinical): <b style="color:${color}">${cvaiClin.toFixed(1)}%</b> — ${band}
-Alt (/ shorter): ${cvaiAlt.toFixed(1)}%
+`CVAI Result: <b style="color:${color}">${cvaiClin.toFixed(1)}%</b> — ${band}
 d+30: ${d1.len.toFixed(1)} px    d-30: ${d2.len.toFixed(1)} px
-Bands:
+Clinical Standards:
   Normal < 3.5%
   Mild 3.5-6.25%
   Moderate 6.25-8.75%
@@ -309,5 +308,6 @@ function convexHull(points){
 </script>
 </body>
 </html>
+
 
 
