@@ -5,3 +5,5 @@ difference between the lengths of the two diagonal measurements of the head
 by the longer diagonal, then multiplying by 100 to express it as a percentage. 
 A normal CVAI is generally considered to be less than 3.5%, according to 
 the Iowa Department of Health and Human Services. 
+
+Tool deployed at https://sleonard01.github.io/CVAI/
